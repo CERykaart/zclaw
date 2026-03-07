@@ -89,6 +89,7 @@ run_host_tests() {
         ../../main/telegram_chat_ids.c \
         ../../main/telegram_poll_policy.c \
         ../../main/agent_commands.c \
+        ../../main/agent_prompt.c \
         ../../main/agent.c \
         ../../main/gpio_policy.c \
         ../../main/tools_gpio.c \

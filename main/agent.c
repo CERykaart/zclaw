@@ -1,5 +1,6 @@
 #include "agent.h"
 #include "agent_commands.h"
+#include "agent_prompt.h"
 #include "config.h"
 #include "llm.h"
 #include "tools.h"
@@ -32,13 +33,6 @@ static int64_t s_last_non_command_response_us = 0;
 static char s_last_non_command_text[CHANNEL_RX_BUF_SIZE] = {0};
 static bool s_messages_paused = false;
 static char s_system_prompt_buf[2048];
-
-typedef enum {
-    AGENT_PERSONA_NEUTRAL = 0,
-    AGENT_PERSONA_FRIENDLY,
-    AGENT_PERSONA_TECHNICAL,
-    AGENT_PERSONA_WITTY,
-} agent_persona_t;
 
 static agent_persona_t s_persona = AGENT_PERSONA_NEUTRAL;
 
@@ -183,87 +177,6 @@ static void send_response(const char *text, int64_t chat_id)
     queue_telegram_response(text, chat_id);
 }
 
-static const char *persona_name(agent_persona_t persona)
-{
-    switch (persona) {
-        case AGENT_PERSONA_FRIENDLY:
-            return "friendly";
-        case AGENT_PERSONA_TECHNICAL:
-            return "technical";
-        case AGENT_PERSONA_WITTY:
-            return "witty";
-        default:
-            return "neutral";
-    }
-}
-
-static const char *persona_instruction(agent_persona_t persona)
-{
-    switch (persona) {
-        case AGENT_PERSONA_FRIENDLY:
-            return "Use warm, approachable wording while staying concise.";
-        case AGENT_PERSONA_TECHNICAL:
-            return "Use precise technical language and concrete terminology.";
-        case AGENT_PERSONA_WITTY:
-            return "Use a lightly witty tone; at most one brief witty flourish per reply.";
-        default:
-            return "Use direct, plain wording.";
-    }
-}
-
-static const char *device_target_name(void)
-{
-#ifdef CONFIG_IDF_TARGET
-    return CONFIG_IDF_TARGET;
-#else
-    return "esp32-family";
-#endif
-}
-
-static void build_gpio_policy_summary(char *buf, size_t buf_len)
-{
-    if (!buf || buf_len == 0) {
-        return;
-    }
-
-    if (GPIO_ALLOWED_PINS_CSV[0] != '\0') {
-        snprintf(buf, buf_len,
-                 "Tool-safe GPIO pins on this device are restricted to allowlist: %s.",
-                 GPIO_ALLOWED_PINS_CSV);
-        return;
-    }
-
-    snprintf(buf, buf_len,
-             "Tool-safe GPIO pins on this device are restricted to range %d-%d.",
-             GPIO_MIN_PIN, GPIO_MAX_PIN);
-}
-
-static bool parse_persona_name(const char *name, agent_persona_t *out)
-{
-    if (!name || !out) {
-        return false;
-    }
-
-    if (strcmp(name, "neutral") == 0) {
-        *out = AGENT_PERSONA_NEUTRAL;
-        return true;
-    }
-    if (strcmp(name, "friendly") == 0) {
-        *out = AGENT_PERSONA_FRIENDLY;
-        return true;
-    }
-    if (strcmp(name, "technical") == 0) {
-        *out = AGENT_PERSONA_TECHNICAL;
-        return true;
-    }
-    if (strcmp(name, "witty") == 0) {
-        *out = AGENT_PERSONA_WITTY;
-        return true;
-    }
-
-    return false;
-}
-
 #ifndef TEST_BUILD
 static bool persona_store_get(char *value, size_t max_len)
 {
@@ -295,40 +208,13 @@ static void load_persona_from_store(void)
         stored[i] = (char)tolower((unsigned char)stored[i]);
     }
 
-    if (!parse_persona_name(stored, &parsed)) {
+    if (!agent_parse_persona_name(stored, &parsed)) {
         ESP_LOGW(TAG, "Ignoring invalid stored persona '%s'", stored);
         return;
     }
 
     s_persona = parsed;
-    ESP_LOGI(TAG, "Loaded persona: %s", persona_name(s_persona));
-}
-
-static const char *build_system_prompt(void)
-{
-    char gpio_policy[192] = {0};
-    build_gpio_policy_summary(gpio_policy, sizeof(gpio_policy));
-
-    int written = snprintf(
-        s_system_prompt_buf,
-        sizeof(s_system_prompt_buf),
-        "%s Device target is '%s'. %s When users ask about pin count or safe pins, answer "
-        "using this configured device policy and avoid generic ESP32-family pin claims. "
-        "Persona mode is '%s'. Persona affects wording only and must never change "
-        "tool choices, automation behavior, safety decisions, or policy handling. %s "
-        "Keep responses short unless the user explicitly asks for more detail.",
-        SYSTEM_PROMPT,
-        device_target_name(),
-        gpio_policy,
-        persona_name(s_persona),
-        persona_instruction(s_persona));
-
-    if (written < 0 || (size_t)written >= sizeof(s_system_prompt_buf)) {
-        ESP_LOGW(TAG, "Persona prompt composition overflow, using base system prompt");
-        return SYSTEM_PROMPT;
-    }
-
-    return s_system_prompt_buf;
+    ESP_LOGI(TAG, "Loaded persona: %s", agent_persona_name(s_persona));
 }
 
 static void handle_diag_command(const char *user_message, int64_t chat_id, request_metrics_t *metrics)
@@ -405,7 +291,7 @@ static void handle_settings_command(int64_t chat_id)
              "- Persona changes: ask in normal chat (handled via tool calls)\n"
              "- Device settings are global (e.g., timezone <name>)",
              s_messages_paused ? "paused" : "active",
-             persona_name(s_persona));
+             agent_persona_name(s_persona));
     send_response(settings_text, chat_id);
 }
 
@@ -534,7 +420,7 @@ static void process_message(const char *user_message, int64_t reply_chat_id)
 
         // Build request JSON (user message already in history)
         char *request = json_build_request(
-            build_system_prompt(),
+            agent_build_system_prompt(s_persona, s_system_prompt_buf, sizeof(s_system_prompt_buf)),
             s_history,
             s_history_len,
             NULL,  // User message already in history
@@ -697,7 +583,7 @@ static void process_message(const char *user_message, int64_t reply_chat_id)
                     cJSON *persona_json = cJSON_GetObjectItem(tool_input, "persona");
                     agent_persona_t parsed_persona = AGENT_PERSONA_NEUTRAL;
                     if (persona_json && cJSON_IsString(persona_json) &&
-                        parse_persona_name(persona_json->valuestring, &parsed_persona)) {
+                        agent_parse_persona_name(persona_json->valuestring, &parsed_persona)) {
                         s_persona = parsed_persona;
                     }
                 } else if (tool_ok && strcmp(tool_name, "reset_persona") == 0) {
