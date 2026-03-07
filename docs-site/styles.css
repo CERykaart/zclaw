@@ -659,6 +659,10 @@ kbd {
     position: relative;
   }
 
+  .sidebar-mobile-hidden {
+    display: none !important;
+  }
+
   .sidebar {
     position: fixed;
     left: 0;
